@@ -1,5 +1,5 @@
 from datasets import load_dataset
-from src.utils.io import load_yaml
+from safe_r2r.utils.io import load_yaml
 
 def main():
     cfg = load_yaml("configs/default.yaml")

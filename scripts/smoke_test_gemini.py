@@ -1,5 +1,5 @@
-from src.utils.io import load_yaml
-from src.generation.gemini_client import GeminiClient, GeminiConfig
+from safe_r2r.utils.io import load_yaml
+from safe_r2r.generation.gemini_client import GeminiClient, GeminiConfig
 
 def main():
     cfg = load_yaml("configs/default.yaml")

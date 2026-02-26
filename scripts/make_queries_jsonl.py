@@ -1,6 +1,6 @@
 from datasets import load_dataset
 from tqdm import tqdm
-from src.utils.io import load_yaml, ensure_dir, write_jsonl
+from safe_r2r.utils.io import load_yaml, ensure_dir, write_jsonl
 
 def normalize_supporting_facts(sf):
     # HF often stores as dict: {"title": [...], "sent_id": [...]}

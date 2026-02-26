@@ -1,0 +1,11 @@
+[project]
+name = "safe_r2r"
+version = "0.1.0"
+description = "SAFE-R2R: Safety-aware retrieval controller"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
