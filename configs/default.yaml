@@ -1,0 +1,22 @@
+project:
+  name: safe-r2r
+  seed: 42
+
+paths:
+  data_raw: data/raw
+  data_processed: data/processed
+  logs: logs
+  artifacts: artifacts
+
+dataset:
+  name: hotpot_qa
+  config: distractor
+  split_train: train
+  split_valid: validation
+  max_train_examples: null
+  max_valid_examples: 500
+
+gemini:
+  model: gemini-2.5-flash
+  temperature: 0.2
+  max_output_tokens: 256

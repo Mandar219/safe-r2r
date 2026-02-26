@@ -3,6 +3,16 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Data and outputs
+data/
+logs/
+artifacts/
+
+# FAISS and embeddings
+*.index
+*.npy
+*.pkl
+
 # C extensions
 *.so
 
