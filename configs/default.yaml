@@ -29,3 +29,12 @@ embedding:
   
 faiss:
   index_type: "IndexFlatIP"  # cosine sim if embeddings normalized
+
+baseline:
+  top_k: 20
+
+llm:
+  backend: mock
+  model_name: Qwen/Qwen2.5-7B-Instruct
+  temperature: 0.2
+  max_new_tokens: 128
