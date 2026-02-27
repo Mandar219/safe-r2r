@@ -20,3 +20,12 @@ gemini:
   model: gemini-2.5-flash
   temperature: 0.2
   max_output_tokens: 256
+
+embedding:
+  model_name: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 64
+  normalize: true
+  max_docs: null   # set 2000 for debugging
+  
+faiss:
+  index_type: "IndexFlatIP"  # cosine sim if embeddings normalized
