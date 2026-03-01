@@ -48,6 +48,7 @@ from safe_r2r.generation.prompting import build_rag_prompt
 from safe_r2r.retrieval.faiss_retriever import FaissRetriever, RetrievedDoc
 from safe_r2r.llm.base import LLMConfig
 from safe_r2r.llm.factory import make_llm
+from safe_r2r.generation.postprocess import postprocess_answer
 
 
 def read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
@@ -156,7 +157,8 @@ def main():
             resp = llm.generate(prompt)
             t3 = time.perf_counter()
 
-            pred = (resp.get("text") or "").strip()
+            raw_pred = (resp.get("text") or "").strip()
+            pred = postprocess_answer(raw_pred)
             # Prefer model-reported latency if present; fallback to measured
             gt_ms = float(resp.get("meta", {}).get("latency_ms", (t3 - t2) * 1000.0))
 
@@ -170,6 +172,7 @@ def main():
                 "question": question,
                 "gold_answer": gold,
                 "pred_answer": pred,
+                "raw_pred_answer": raw_pred,
                 "top_k": int(top_k),
                 "retrieved": [
                     {"doc_id": d.doc_id, "score": d.score, "title": d.title}
