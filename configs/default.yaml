@@ -1,0 +1,40 @@
+project:
+  name: safe-r2r
+  seed: 42
+
+paths:
+  data_raw: data/raw
+  data_processed: data/processed
+  logs: logs
+  artifacts: artifacts
+
+dataset:
+  name: hotpot_qa
+  config: distractor
+  split_train: train
+  split_valid: validation
+  max_train_examples: null
+  max_valid_examples: 500
+
+gemini:
+  model: gemini-2.5-flash
+  temperature: 0.2
+  max_output_tokens: 256
+
+embedding:
+  model_name: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 64
+  normalize: true
+  max_docs: null   # set 2000 for debugging
+  
+faiss:
+  index_type: "IndexFlatIP"  # cosine sim if embeddings normalized
+
+baseline:
+  top_k: 10
+
+llm:
+  backend: mock
+  model_name: Qwen/Qwen2.5-7B-Instruct
+  temperature: 0.0
+  max_new_tokens: 64
