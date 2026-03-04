@@ -38,3 +38,9 @@ llm:
   model_name: Qwen/Qwen2.5-7B-Instruct
   temperature: 0.0
   max_new_tokens: 64
+
+ladder:
+  rung_top_k:
+    "1": 5
+    "2": 10
+    "3": 15
