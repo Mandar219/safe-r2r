@@ -44,3 +44,10 @@ ladder:
     "1": 5
     "2": 10
     "3": 15
+    "4": 15 
+
+reranker:
+  enabled: true
+  model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
+  faiss_top_n: 50     # how many docs to take from FAISS before rerank
+  batch_size: 32
