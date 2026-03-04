@@ -16,6 +16,7 @@ from safe_r2r.evaluation.metrics import exact_match, f1_score
 
 from safe_r2r.retrieval.faiss_retriever import FaissRetriever
 from safe_r2r.retrieval.ladder import RetrievalLadder, LadderConfig
+from safe_r2r.retrieval.reranker import CrossEncoderReranker, RerankerConfig
 
 
 def read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
@@ -64,7 +65,25 @@ def main():
     # Ladder config parsing
     rung_top_k_raw = cfg.get("ladder", {}).get("rung_top_k", {})
     rung_top_k = {int(k): int(v) for k, v in rung_top_k_raw.items()}
-    ladder = RetrievalLadder(retriever, LadderConfig(rung_top_k=rung_top_k))
+
+    rer_cfg = cfg.get("reranker", {})
+    rer_enabled = bool(rer_cfg.get("enabled", False))
+    reranker = None
+    rerank_faiss_top_n = int(rer_cfg.get("faiss_top_n", 50))
+
+    if rer_enabled:
+        reranker = CrossEncoderReranker(
+            RerankerConfig(
+                model_name=rer_cfg.get("model_name", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
+                batch_size=int(rer_cfg.get("batch_size", 32)),
+            )
+        )
+
+    ladder = RetrievalLadder(
+        retriever,
+        LadderConfig(rung_top_k=rung_top_k, rerank_faiss_top_n=rerank_faiss_top_n),
+        reranker=reranker,
+    )
 
     # LLM
     llm_cfg = LLMConfig(**cfg["llm"])
@@ -105,7 +124,7 @@ def main():
                     "5) Do NOT repeat the question.\n"
                     "6) If yes/no, output exactly: yes OR no\n"
                     "7) If the documents do not contain enough information, output exactly: Insufficient evidence\n\n"
-                    f"Question: {question}\n"
+                    f"Question: {q}\n"
                     "Final answer:"
                 )
             else:
