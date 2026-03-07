@@ -3,12 +3,12 @@ from typing import Dict, List, Optional
 
 from safe_r2r.retrieval.faiss_retriever import FaissRetriever, RetrievedDoc
 from safe_r2r.retrieval.reranker import CrossEncoderReranker
+from safe_r2r.retrieval.compress import ExtractiveCompressor
 
 
 @dataclass
 class LadderConfig:
     rung_top_k: Dict[int, int]
-    # Reranker settings (optional)
     rerank_faiss_top_n: int = 50
 
 
@@ -16,10 +16,10 @@ class RetrievalLadder:
     """
     Ladder:
       rung 0 -> no retrieval
-      rung 1 -> FAISS top_k=5
-      rung 2 -> FAISS top_k=10
-      rung 3 -> FAISS top_k=15
-      rung 4 -> FAISS top_n=50 -> rerank -> keep top_k=15
+      rung 1 -> FAISS top 5 + extractive compression
+      rung 2 -> FAISS top 15 + extractive compression
+      rung 3 -> FAISS top 50 -> rerank -> top 15 + extractive compression
+      rung 4 -> FAISS top 50 -> rerank -> top 15 full docs
     """
 
     def __init__(
@@ -27,50 +27,71 @@ class RetrievalLadder:
         retriever: FaissRetriever,
         cfg: LadderConfig,
         reranker: Optional[CrossEncoderReranker] = None,
+        compressor: Optional[ExtractiveCompressor] = None,
     ):
         self.retriever = retriever
         self.cfg = cfg
         self.reranker = reranker
+        self.compressor = compressor
 
     def top_k_for_rung(self, rung: int) -> int:
         if rung == 0:
             return 0
         if rung not in self.cfg.rung_top_k:
-            raise ValueError(f"Unknown rung={rung}. Valid rungs: {sorted([0] + list(self.cfg.rung_top_k.keys()))}")
+            raise ValueError(f"Unknown rung={rung}. Valid: {sorted([0] + list(self.cfg.rung_top_k.keys()))}")
         return int(self.cfg.rung_top_k[rung])
+
+    def _maybe_compress(self, query: str, docs: List[RetrievedDoc]) -> List[RetrievedDoc]:
+        if self.compressor is None:
+            return docs
+        out: List[RetrievedDoc] = []
+        for d in docs:
+            ctext = self.compressor.compress(query, d.text)
+            # If compression fails, fall back to original
+            out.append(RetrievedDoc(
+                doc_id=d.doc_id,
+                score=d.score,
+                title=d.title,
+                text=ctext if ctext else d.text,
+            ))
+        return out
 
     def retrieve(self, question: str, rung: int) -> List[RetrievedDoc]:
         top_k = self.top_k_for_rung(rung)
         if rung == 0 or top_k <= 0:
             return []
 
-        # Simple FAISS-only rungs
-        if rung in (1, 2, 3) or self.reranker is None:
-            return self.retriever.search(question, top_k=top_k)
+        # rungs 1 and 2: FAISS only + compression
+        if rung in (1, 2):
+            docs = self.retriever.search(question, top_k=top_k)
+            return self._maybe_compress(question, docs)
 
-        # Rerank rung (4)
-        if rung == 4:
+        # rungs 3 and 4: FAISS topN -> rerank -> keep topK
+        if rung in (3, 4):
+            if self.reranker is None:
+                raise ValueError("Rung 3/4 requires reranker but reranker is None")
+
             faiss_top_n = int(self.cfg.rerank_faiss_top_n)
-            # Stage 1: dense retrieval
             cand_docs = self.retriever.search(question, top_k=faiss_top_n)
 
-            # Stage 2: cross-encoder scoring
             title_text = [(d.title, d.text) for d in cand_docs]
             scores = self.reranker.rerank(question, title_text)
 
-            # Sort by cross-encoder score desc
             scored = list(zip(cand_docs, scores))
             scored.sort(key=lambda x: x[1], reverse=True)
 
-            # Return top_k with updated score = rerank score
-            out: List[RetrievedDoc] = []
+            top_docs: List[RetrievedDoc] = []
             for d, s in scored[:top_k]:
-                out.append(RetrievedDoc(
+                top_docs.append(RetrievedDoc(
                     doc_id=d.doc_id,
-                    score=float(s),
+                    score=float(s),  # reranker score
                     title=d.title,
                     text=d.text,
                 ))
-            return out
+
+            # rung 3: compressed; rung 4: full
+            if rung == 3:
+                return self._maybe_compress(question, top_docs)
+            return top_docs
 
         raise ValueError(f"Unhandled rung={rung}")

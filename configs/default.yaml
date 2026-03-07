@@ -42,7 +42,7 @@ llm:
 ladder:
   rung_top_k:
     "1": 5
-    "2": 10
+    "2": 15
     "3": 15
     "4": 15 
 
@@ -51,3 +51,14 @@ reranker:
   model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
   faiss_top_n: 50     # how many docs to take from FAISS before rerank
   batch_size: 32
+
+compression:
+  enabled: true
+  # sentence selection per doc
+  max_sents_per_doc: 4
+  # hard safety caps to keep prompts bounded
+  max_words_per_sent: 35
+  max_words_per_doc: 140
+  # embedder to score sentence relevance to question
+  embedder_model_name: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 64
