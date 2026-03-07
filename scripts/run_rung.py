@@ -13,6 +13,7 @@ from safe_r2r.llm.factory import make_llm
 from safe_r2r.generation.prompting import build_rag_prompt
 from safe_r2r.generation.postprocess import postprocess_answer
 from safe_r2r.evaluation.metrics import exact_match, f1_score
+from safe_r2r.evaluation.token_overlap import precision_recall_f1
 
 from safe_r2r.retrieval.faiss_retriever import FaissRetriever
 from safe_r2r.retrieval.ladder import RetrievalLadder, LadderConfig
@@ -95,6 +96,8 @@ def main():
 
     ems, f1s = [], []
     rt_ms, gt_ms = [], []
+    precisions, recalls = [], []
+    prompt_toks, completion_toks, total_toks = [], [], []
     n = 0
 
     with open(log_path, "w", encoding="utf-8") as out_f:
@@ -139,10 +142,17 @@ def main():
             pred = postprocess_answer(raw_pred)
 
             em = exact_match(pred, gold)
-            f1 = f1_score(pred, gold)
+            # f1 = f1_score(pred, gold)
+            prf = precision_recall_f1(pred, gold)  # token overlap P/R/F1
+            f1 = prf.f1
 
             retrieval_latency = (t1 - t0) * 1000.0
-            gen_latency = float(resp.get("meta", {}).get("latency_ms", (t3 - t2) * 1000.0))
+            meta = resp.get("meta", {}) or {}
+            gen_latency = float(meta.get("latency_ms", (t3 - t2) * 1000.0))
+
+            pt = int(meta.get("prompt_tokens", -1))
+            ct = int(meta.get("completion_tokens", -1))
+            tt = int(meta.get("total_tokens", (pt + ct) if pt >= 0 and ct >= 0 else -1))
 
             row = {
                 "qid": qid,
@@ -156,7 +166,15 @@ def main():
                 "retrieval_latency_ms": retrieval_latency,
                 "generation_latency_ms": gen_latency,
                 "em": int(em),
-                "f1": float(f1),
+                "precision": prf.precision,
+                "recall": prf.recall,
+                "f1": prf.f1,
+                "common_tokens": prf.common,
+                "pred_tokens": prf.pred_len,
+                "gold_tokens": prf.gold_len,
+                "prompt_tokens": pt,
+                "completion_tokens": ct,
+                "total_tokens": tt,
                 "llm_backend": llm_cfg.backend,
                 "llm_model": llm_cfg.model_name,
             }
@@ -164,6 +182,12 @@ def main():
 
             ems.append(em); f1s.append(f1)
             rt_ms.append(retrieval_latency); gt_ms.append(gen_latency)
+            precisions.append(prf.precision)
+            recalls.append(prf.recall)
+
+            if pt >= 0: prompt_toks.append(pt)
+            if ct >= 0: completion_toks.append(ct)
+            if tt >= 0: total_toks.append(tt)
             n += 1
 
     metrics = {
@@ -175,6 +199,11 @@ def main():
         "llm_model": llm_cfg.model_name,
         "em": _safe_mean(ems),
         "f1": _safe_mean(f1s),
+        "precision": _safe_mean(precisions),
+        "recall": _safe_mean(recalls),
+        "avg_prompt_tokens": _safe_mean([float(x) for x in prompt_toks]),
+        "avg_completion_tokens": _safe_mean([float(x) for x in completion_toks]),
+        "avg_total_tokens": _safe_mean([float(x) for x in total_toks]),
         "avg_retrieval_ms": _safe_mean(rt_ms),
         "avg_generation_ms": _safe_mean(gt_ms),
         "log_path": log_path,
