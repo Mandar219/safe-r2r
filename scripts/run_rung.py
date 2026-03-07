@@ -18,6 +18,7 @@ from safe_r2r.evaluation.token_overlap import precision_recall_f1
 from safe_r2r.retrieval.faiss_retriever import FaissRetriever
 from safe_r2r.retrieval.ladder import RetrievalLadder, LadderConfig
 from safe_r2r.retrieval.reranker import CrossEncoderReranker, RerankerConfig
+from safe_r2r.retrieval.compress import ExtractiveCompressor, CompressionConfig
 
 
 def read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
@@ -80,10 +81,26 @@ def main():
             )
         )
 
+    comp_cfg = cfg.get("compression", {})
+    comp_enabled = bool(comp_cfg.get("enabled", False))
+    compressor = None
+
+    if comp_enabled:
+        compressor = ExtractiveCompressor(
+            CompressionConfig(
+                embedder_model_name=comp_cfg.get("embedder_model_name", "sentence-transformers/all-MiniLM-L6-v2"),
+                batch_size=int(comp_cfg.get("batch_size", 64)),
+                max_sents_per_doc=int(comp_cfg.get("max_sents_per_doc", 4)),
+                max_words_per_sent=int(comp_cfg.get("max_words_per_sent", 35)),
+                max_words_per_doc=int(comp_cfg.get("max_words_per_doc", 140)),
+            )
+        )
+
     ladder = RetrievalLadder(
         retriever,
         LadderConfig(rung_top_k=rung_top_k, rerank_faiss_top_n=rerank_faiss_top_n),
         reranker=reranker,
+        compressor=compressor,
     )
 
     # LLM
