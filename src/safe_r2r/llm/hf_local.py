@@ -78,7 +78,8 @@ class HfLocalLLM(BaseLLM):
         )
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
-        # Deterministic vs sampling
+        prompt_tokens = int(inputs["input_ids"].shape[1])
+
         temperature = float(self.cfg.temperature)
         do_sample = temperature > 0.0
 
@@ -94,7 +95,17 @@ class HfLocalLLM(BaseLLM):
         # Decode ONLY the new tokens (completion), not the full prompt
         # out shape: [1, prompt_len + gen_len]
         gen_ids = out[0, inputs["input_ids"].shape[1]:]
+        completion_tokens = int(gen_ids.shape[0])
+
         text = self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
         t1 = time.perf_counter()
-        return {"text": text, "meta": {"latency_ms": (t1 - t0) * 1000.0}}
+        return {
+            "text": text,
+            "meta": {
+                "latency_ms": (t1 - t0) * 1000.0,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
