@@ -8,6 +8,13 @@ from safe_r2r.evaluation.token_overlap import precision_recall_f1
 from safe_r2r.generation.postprocess import postprocess_answer
 from safe_r2r.generation.prompting import build_rag_prompt
 
+from safe_r2r.uncertainty.signals import (
+    is_insufficient,
+    is_yesno,
+    answer_in_context_fraction,
+    score_margin,
+)
+
 
 def read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
@@ -110,6 +117,19 @@ def run_rung(
             ct = int(meta.get("completion_tokens", -1))
             tt = int(meta.get("total_tokens", (pt + ct) if pt >= 0 and ct >= 0 else -1))
 
+            # Uncertainty Signals
+            faiss_scores = [float(d.score) for d in docs]  # note: for rung3/4 these might be rerank scores
+            m = score_margin(faiss_scores)
+
+            signals = {
+                "is_insufficient": is_insufficient(pred),
+                "is_yesno": is_yesno(pred),
+                "ans_in_ctx_frac": answer_in_context_fraction(pred, docs),
+                "score_top1": m["top1"],
+                "score_margin12": m["margin12"],
+                "score_margin1k": m["margin1k"],
+            }
+
             # Log row
             row = {
                 "qid": qid,
@@ -132,6 +152,7 @@ def run_rung(
                 "llm_backend": llm_backend,
                 "llm_model": llm_model,
             }
+            row.update(signals)
             out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
             # Accumulate
