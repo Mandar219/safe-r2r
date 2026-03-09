@@ -1,5 +1,6 @@
 from datasets import load_dataset
 from tqdm import tqdm
+import argparse
 from safe_r2r.utils.io import load_yaml, ensure_dir, write_jsonl
 
 def normalize_supporting_facts(sf):
@@ -57,11 +58,23 @@ def normalize_example(ex):
     }
 
 def main():
-    cfg = load_yaml("configs/default.yaml")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--max_examples", type=int, default=500)
+    parser.add_argument("--split", type=str, default="validation", choices=["train","validation"])
+    args = parser.parse_args()
+
+    cfg = load_yaml(args.config)
     ds_name = cfg["dataset"]["name"]
     ds_cfg  = cfg["dataset"]["config"]
-    split   = cfg["dataset"]["split_valid"]
-    max_n   = cfg["dataset"]["max_valid_examples"]
+
+    split = args.split
+    if split is None:
+        split = cfg["dataset"]["split_valid"]
+
+    max_n = args.max_examples
+    if max_n is None:
+        max_n = cfg["dataset"]["max_valid_examples"]
 
     ensure_dir(cfg["paths"]["data_processed"])
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from pathlib import Path
+import json
 
 from safe_r2r.utils.io import load_yaml, ensure_dir
 from safe_r2r.llm.base import LLMConfig
@@ -110,7 +111,7 @@ def main():
             config_path=args.config,
         )
         print("Saved metrics:", metrics_path)
-        print(metrics)
+        print(json.dumps(metrics, indent=2))
 
     print("\nAll requested rungs completed.")
 
