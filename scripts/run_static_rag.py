@@ -91,11 +91,10 @@ def main():
         )
 
     artifacts_dir = cfg["paths"]["artifacts"]
-    index_path = f"{artifacts_dir}/faiss_{ds_name}_{ds_cfg}.index"
-    ids_path = f"{artifacts_dir}/faiss_{ds_name}_{ds_cfg}_doc_ids.json"
-    meta_path = f"{artifacts_dir}/faiss_{ds_name}_{ds_cfg}_meta.json"
-
-    doc_lookup_path = f'{cfg["paths"]["data_processed"]}/{ds_name}_{ds_cfg}_doc_lookup.json'
+    index_path = f"{artifacts_dir}/faiss_{ds_name}_{ds_cfg}_trainval.index"
+    ids_path = f"{artifacts_dir}/faiss_{ds_name}_{ds_cfg}_trainval_doc_ids.json"
+    meta_path = f"{artifacts_dir}/faiss_{ds_name}_{ds_cfg}_trainval_meta.json"
+    doc_lookup_path = f'{cfg["paths"]["data_processed"]}/{ds_name}_{ds_cfg}_trainval_doc_lookup.json'
 
     for p in [index_path, ids_path, meta_path, doc_lookup_path]:
         if not Path(p).exists():
