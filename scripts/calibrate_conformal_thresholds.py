@@ -23,40 +23,61 @@ def compute_S(row: Dict[str, Any], eps: float, ws: float, wm: float, wi: float) 
 
     return ws * (1.0 - support) + wm * (1.0 / (eps + margin)) + wi * float(insuff)
 
-def calibrate_threshold(rows: List[Dict[str, Any]], alpha: float, eps: float, ws: float, wm: float, wi: float):
+def clopper_pearson_ub(errs: int, n: int, delta: float) -> float:
+    """
+    Upper bound for binomial proportion using Clopper-Pearson.
+    Returns U such that P(p <= U) >= 1-delta.
+    """
+    if n == 0:
+        return 0.0
+    if errs == n:
+        return 1.0
+    try:
+        from scipy.stats import beta
+        # CP upper bound: BetaInv(1-delta, errs+1, n-errs)
+        return float(beta.ppf(1 - delta, errs + 1, n - errs))
+    except Exception:
+        # Fallback: Hoeffding bound (looser but no scipy)
+        phat = errs / n
+        import math
+        return min(1.0, phat + math.sqrt(math.log(1/delta) / (2*n)))
+
+def calibrate_threshold(rows, alpha, eps, ws, wm, wi, delta=0.05):
     scored = []
     for r in rows:
         S = compute_S(r, eps=eps, ws=ws, wm=wm, wi=wi)
-        err = 0 if int(r.get("em", 0)) == 1 else 1
+        em = r.get("em", 0)
+        try:
+            em_val = float(em)
+        except Exception:
+            em_val = 0.0
+        err = 0 if em_val >= 1.0 else 1
         scored.append((S, err))
 
     scored.sort(key=lambda x: x[0])
 
-    # prefix scan
     errs = 0
     best_k = 0
-    best_tau = None
+    best_tau = float("-inf")
 
     for k, (S, err) in enumerate(scored, start=1):
         errs += err
-        risk = errs / k
-        if risk <= alpha:
+        ucb = clopper_pearson_ub(errs, k, delta=delta)
+        if ucb <= alpha:
             best_k = k
             best_tau = S
 
-    # If even the lowest-risk example violates, accept none
-    if best_k == 0:
-        best_tau = float("-inf")
-
     accept_rate = best_k / len(scored)
-    # risk on accepted (calibration)
     cal_risk = (sum(e for _, e in scored[:best_k]) / best_k) if best_k > 0 else 0.0
+    cal_ucb = clopper_pearson_ub(sum(e for _, e in scored[:best_k]), best_k, delta=delta) if best_k > 0 else 0.0
 
     return {
         "alpha": alpha,
         "tau": best_tau,
         "accept_rate_calib": accept_rate,
         "risk_calib": cal_risk,
+        "risk_ucb_calib": cal_ucb,
+        "delta": delta,
         "n_calib": len(scored),
         "n_accept": best_k,
         "ws": ws,
@@ -74,6 +95,7 @@ def main():
     ap.add_argument("--ws", type=float, default=1.0)
     ap.add_argument("--wm", type=float, default=0.2)
     ap.add_argument("--wi", type=float, default=0.5)
+    ap.add_argument("--delta", type=float, default=0.05)
     args = ap.parse_args()
 
     rows = read_jsonl(args.calib_log)
@@ -87,7 +109,7 @@ def main():
     }
 
     for a in alphas:
-        out["thresholds"].append(calibrate_threshold(rows, a, args.eps, args.ws, args.wm, args.wi))
+        out["thresholds"].append(calibrate_threshold(rows, a, args.eps, args.ws, args.wm, args.wi, delta=args.delta))
 
     with open(args.out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
