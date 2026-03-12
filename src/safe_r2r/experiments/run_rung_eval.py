@@ -130,6 +130,17 @@ def run_rung(
                 "score_margin1k": m["margin1k"],
             }
 
+            retrieved_logged = []
+            for d in docs:
+                text = getattr(d, "text", "")
+                retrieved_logged.append({
+                    "doc_id": d.doc_id,
+                    "score": float(d.score),
+                    "title": d.title,
+                    "text": text,
+                    "text_chars": len(text) if isinstance(text, str) else 0
+                })
+
             # Log row
             row = {
                 "qid": qid,
@@ -139,7 +150,7 @@ def run_rung(
                 "pred_answer": pred,
                 "rung": int(rung),
                 "num_docs": len(docs),
-                "retrieved": [{"doc_id": d.doc_id, "score": d.score, "title": d.title} for d in docs],
+                "retrieved": retrieved_logged,
                 "retrieval_latency_ms": retrieval_latency,
                 "generation_latency_ms": gen_latency,
                 "prompt_tokens": pt,
