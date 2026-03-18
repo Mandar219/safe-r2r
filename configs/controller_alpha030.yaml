@@ -1,0 +1,30 @@
+controller:
+  rung_logs:
+    0: logs/calib10k_rung0_with_sentmax_spanhit_qaverif.jsonl
+    1: logs/calib10k_rung1_with_sentmax_spanhit_qaverif.jsonl
+    2: logs/calib10k_rung2_with_sentmax_spanhit_qaverif.jsonl
+    3: logs/calib10k_rung3_with_sentmax_spanhit_qaverif.jsonl
+    4: logs/calib10k_rung4_with_sentmax_spanhit_qaverif.jsonl
+
+  taus:
+    1: 2.438971
+    2: 0.545593
+    3: 1.000000
+    4: 2.305459
+
+  weights:
+    wq: 6.0
+    wv: 2.0
+    ws: 2.0
+    wi: 4.0
+    wl: 2.0
+    wt: 2.0
+
+  feature_knobs:
+    top2_hit_k: 2
+    length_limit: 5
+
+  rung_order: [0, 1, 2, 3, 4]
+
+  nli_model: roberta-large-mnli
+  qa_model: distilbert-base-cased-distilled-squad
