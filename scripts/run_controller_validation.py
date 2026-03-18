@@ -2,11 +2,11 @@
 import argparse
 import json
 import time
+import re
 from pathlib import Path
-from typing import Dict, Any, Iterator, List, Optional
+from typing import Dict, Any, Iterator, List
 
-import yaml
-import torch
+import numpy as np
 from tqdm import tqdm
 from transformers import pipeline
 
@@ -24,6 +24,7 @@ from safe_r2r.retrieval.reranker import CrossEncoderReranker, RerankerConfig
 from safe_r2r.retrieval.compress import ExtractiveCompressor, CompressionConfig
 
 from safe_r2r.controller.scoring import compute_score
+from safe_r2r.controller.qa_verifier import QAVerifier
 
 
 def read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
@@ -46,7 +47,6 @@ def _safe_mean(xs: List[float]) -> float:
 
 
 def normalize_answer(s: str) -> str:
-    import re
     if not isinstance(s, str):
         return ""
     s = s.lower().strip()
@@ -56,44 +56,14 @@ def normalize_answer(s: str) -> str:
     return s
 
 
-def exact_match_text(pred: str, gold: str) -> int:
-    return int(normalize_answer(pred) == normalize_answer(gold))
-
-
-def token_f1(pred: str, gold: str) -> float:
-    p = normalize_answer(pred).split()
-    g = normalize_answer(gold).split()
-    if not p and not g:
-        return 1.0
-    if not p or not g:
-        return 0.0
-    common = {}
-    for t in p:
-        common[t] = common.get(t, 0) + 1
-    overlap = 0
-    used = {}
-    for t in g:
-        if common.get(t, 0) > used.get(t, 0):
-            overlap += 1
-            used[t] = used.get(t, 0) + 1
-    if overlap == 0:
-        return 0.0
-    prec = overlap / len(p)
-    rec = overlap / len(g)
-    return 2 * prec * rec / (prec + rec)
-
-
 def split_sentences(text: str) -> List[str]:
-    import re
     text = re.sub(r"\s+", " ", str(text or "")).strip()
     if not text:
         return []
-    parts = re.split(r"(?<=[\.\!\?])\s+", text)
-    return [p.strip() for p in parts if p.strip()]
+    return [p.strip() for p in re.split(r"(?<=[\.\!\?])\s+", text) if p.strip()]
 
 
 def _tok(s: str) -> List[str]:
-    import re
     return re.findall(r"[A-Za-z0-9]+", str(s or "").lower())
 
 
@@ -134,20 +104,22 @@ def parse_nli_scores(all_scores):
 def compute_sentence_max_verifier(nli, question: str, pred_answer: str, retrieved: List[Dict[str, Any]], topk_docs: int = 5) -> float:
     if not pred_answer.strip():
         return 0.0
+
     hyp = f"Question: {question}\nAnswer: {pred_answer}"
     inputs = []
+
     for d in retrieved[:topk_docs]:
-        txt = d.get("text", "") or ""
-        if not txt:
-            txt = d.get("title", "") or ""
+        txt = d.get("text", "") or d.get("title", "") or ""
         prem = build_sentence_max_premise(txt, question, pred_answer)
         if prem:
             inputs.append({"text": prem, "text_pair": hyp})
+
     if not inputs:
         return 0.0
 
     outs = nli(inputs, padding=True, truncation=True)
     best_margin = -1.0
+
     for out in outs:
         if isinstance(out, list):
             pe, pc = parse_nli_scores(out)
@@ -157,12 +129,12 @@ def compute_sentence_max_verifier(nli, question: str, pred_answer: str, retrieve
             pe = sc if "entail" in lab else 0.0
             pc = sc if "contrad" in lab else 0.0
         best_margin = max(best_margin, pe - pc)
+
     m = (best_margin + 1.0) / 2.0
     return max(0.0, min(1.0, m))
 
 
 def normalize_text(s: str) -> str:
-    import re
     s = str(s or "").lower()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -173,6 +145,7 @@ def compute_span_hits(pred_answer: str, retrieved: List[Dict[str, Any]], topk: i
     ans = normalize_text(pred_answer)
     if ans in {"", "insufficient evidence", "unknown", "none", "not enough information"}:
         return 0, 0
+
     hits = 0
     full = []
     for d in retrieved[:topk]:
@@ -180,30 +153,10 @@ def compute_span_hits(pred_answer: str, retrieved: List[Dict[str, Any]], topk: i
         full.append(txt)
         if ans and ans in normalize_text(txt):
             hits += 1
+
     concat = normalize_text(" ".join(full))
     span_hit = int(ans in concat) if ans else 0
     return span_hit, hits
-
-
-def build_context_for_qa(retrieved: List[Dict[str, Any]], topk_docs: int = 5, max_chars: int = 6000) -> str:
-    pieces = []
-    for d in retrieved[:topk_docs]:
-        title = d.get("title", "") or ""
-        text = d.get("text", "") or ""
-        chunk = f"Title: {title}\n{text}".strip()
-        if chunk:
-            pieces.append(chunk)
-    return "\n\n".join(pieces)[:max_chars]
-
-
-def qa_substring_fallback(pred_answer: str, context: str):
-    ans = normalize_text(pred_answer)
-    ctx = normalize_text(context)
-    if ans in {"", "insufficient evidence", "unknown", "none", "not enough information"}:
-        return "", 0.0, 0, 0.0
-    if ans and ans in ctx:
-        return pred_answer, 1.0, 1, 1.0
-    return "", 0.0, 0, 0.0
 
 
 def main():
@@ -215,7 +168,7 @@ def main():
     ap.add_argument("--max_examples", type=int, default=None)
     ap.add_argument("--force_rung4_fallback", action="store_true")
     ap.add_argument("--split", type=str, default=None, help="override dataset split")
-    ap.add_argument("--device", type=int, default=0, help="GPU id for verifier pipelines; use -1 for CPU")
+    ap.add_argument("--device", type=int, default=0, help="GPU id for verifier models; use -1 for CPU")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -278,7 +231,6 @@ def main():
     llm_cfg = LLMConfig(**cfg["llm"])
     llm = make_llm(llm_cfg)
 
-    # frozen controller config
     rung_order = [int(r) for r in controller_cfg.get("rung_order", [0, 1, 2, 3, 4])]
     taus = {int(k): float(v) for k, v in controller_cfg.get("taus", {}).items()}
     weights = controller_cfg["weights"]
@@ -287,7 +239,6 @@ def main():
     if global_tau is not None:
         global_tau = float(global_tau)
 
-    # verifier pipelines
     nli_model = controller_cfg.get("nli_model", "roberta-large-mnli")
     qa_model = controller_cfg.get("qa_model", "distilbert-base-cased-distilled-squad")
 
@@ -298,28 +249,24 @@ def main():
         return_all_scores=True,
         batch_size=64,
     )
-
-    # for now keep QA verifier as substring fallback only, since that was the stable signal
-    # if you later want full QA model inference in this script, add it here
+    qa_verifier = QAVerifier(model_name=qa_model, device=args.device)
 
     out_rows = []
-
-    certified_accepted = []
+    certified_rows = []
     answered_rows = []
 
-    for n, ex in enumerate(tqdm(read_jsonl(queries_path), desc="Controller validation")):
-        if args.max_examples is not None and n >= int(args.max_examples):
+    for idx, ex in enumerate(tqdm(read_jsonl(queries_path), desc="Controller validation")):
+        if args.max_examples is not None and idx >= int(args.max_examples):
             break
 
         qid = ex["qid"]
         q = ex["question"]
         gold = ex["answer"]
 
-        selected = None
         rows_by_rung = {}
+        selected = None
 
         for rung in rung_order:
-            # retrieval
             t0 = time.perf_counter()
             docs = ladder.retrieve(q, rung=rung)
             t1 = time.perf_counter()
@@ -335,7 +282,6 @@ def main():
                     "text_chars": len(txt) if isinstance(txt, str) else 0,
                 })
 
-            # prompt
             if rung == 0:
                 prompt = (
                     "Answer the question concisely. Use only your internal knowledge.\n\n"
@@ -353,7 +299,6 @@ def main():
             else:
                 prompt = build_rag_prompt(q, docs)
 
-            # generation
             t2 = time.perf_counter()
             resp = llm.generate(prompt)
             t3 = time.perf_counter()
@@ -372,7 +317,6 @@ def main():
             ct = int(meta.get("completion_tokens", -1))
             tt = int(meta.get("total_tokens", (pt + ct) if pt >= 0 and ct >= 0 else -1))
 
-            # signals
             verifier_sent_max_margin = compute_sentence_max_verifier(
                 nli=nli,
                 question=q,
@@ -383,8 +327,13 @@ def main():
 
             span_hit, span_doc_hits = compute_span_hits(pred, retrieved_logged, topk=15)
 
-            context = build_context_for_qa(retrieved_logged, topk_docs=5, max_chars=6000)
-            qa_answer, qa_score, qa_match_em, qa_match_f1 = qa_substring_fallback(pred, context)
+            qa_answer, qa_score, qa_match_em, qa_match_f1 = qa_verifier.verify(
+                question=q,
+                pred_answer=pred,
+                retrieved=retrieved_logged,
+                topk_docs=5,
+                max_context_chars=6000,
+            )
 
             row = {
                 "qid": qid,
@@ -414,6 +363,8 @@ def main():
                 "qa_match_f1": qa_match_f1,
                 "llm_backend": llm_cfg.backend,
                 "llm_model": llm_cfg.model_name,
+                "nli_model": nli_model,
+                "qa_model": qa_verifier.model_name,
             }
 
             score = compute_score(
@@ -436,8 +387,8 @@ def main():
                 break
 
         fallback_used = 0
-        accepted_certified = 1
         answered = 1
+        accepted_certified = 1
 
         if selected is None:
             if args.force_rung4_fallback:
@@ -463,7 +414,6 @@ def main():
         else:
             final_rung, final_tau, final_row = selected
 
-        # optional global controller gate
         if answered == 1 and global_tau is not None and final_row["controller_score"] > global_tau:
             if args.force_rung4_fallback:
                 fallback_used = 1
@@ -514,7 +464,7 @@ def main():
         if answered == 1:
             answered_rows.append(out)
         if accepted_certified == 1:
-            certified_accepted.append(out)
+            certified_rows.append(out)
 
     write_jsonl(args.out, out_rows)
 
@@ -522,11 +472,11 @@ def main():
         "num_queries": len(out_rows),
         "num_answered_total": len(answered_rows),
         "answer_coverage": len(answered_rows) / len(out_rows) if out_rows else 0.0,
-        "num_certified_accepted": len(certified_accepted),
-        "certified_coverage": len(certified_accepted) / len(out_rows) if out_rows else 0.0,
+        "num_certified_accepted": len(certified_rows),
+        "certified_coverage": len(certified_rows) / len(out_rows) if out_rows else 0.0,
         "num_fallback_answered": sum(int(r.get("fallback_used", 0)) for r in out_rows),
         "num_unanswered": sum(1 for r in out_rows if int(r.get("answered", 0)) == 0),
-        "accept_by_rung": {str(r): sum(1 for x in certified_accepted if x.get("selected_rung") == r) for r in rung_order},
+        "accept_by_rung": {str(r): sum(1 for x in certified_rows if x.get("selected_rung") == r) for r in rung_order},
         "fallback_by_rung": {str(r): sum(1 for x in out_rows if int(x.get("fallback_used", 0)) == 1 and x.get("selected_rung") == r) for r in rung_order},
         "controller_config": controller_cfg,
         "force_rung4_fallback": bool(args.force_rung4_fallback),
@@ -541,8 +491,8 @@ def main():
             vals = [float(r[key]) for r in answered_rows if r.get(key) is not None]
             summary[f"avg_{key}_answered"] = _safe_mean(vals)
 
-    if certified_accepted:
-        ems = np.array([int(r["em"]) for r in certified_accepted], dtype=int)
+    if certified_rows:
+        ems = np.array([int(r["em"]) for r in certified_rows], dtype=int)
         summary["empirical_accuracy_certified"] = float(np.mean(ems))
         summary["empirical_risk_certified"] = float(np.mean(1 - ems))
 

@@ -31,7 +31,7 @@ def is_date_like_answer(row: Dict[str, Any]) -> bool:
     ans = str(row.get("pred_answer", "") or "").strip().lower()
     months = {
         "january", "february", "march", "april", "may", "june",
-        "july", "august", "september", "october", "november", "december"
+        "july", "august", "september", "october", "november", "december",
     }
     if any(m in ans for m in months):
         return True
@@ -95,6 +95,11 @@ def compute_score(
     topk_hit_k: int = 2,
     length_limit: int = 5,
 ) -> float:
+    """
+    Lower score = safer.
+
+    R = wq(1-q) + wv(1-v) + ws(1-s) + wi*i + wl*l + wt(1-t)
+    """
     q = clip01(row.get(qa_key, 0.0))
     v = clip01(row.get(verifier_key, 0.0))
     s = span_support_from_hits(row)
