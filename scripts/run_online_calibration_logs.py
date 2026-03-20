@@ -23,6 +23,7 @@ from safe_r2r.retrieval.reranker import CrossEncoderReranker, RerankerConfig
 from safe_r2r.retrieval.compress import ExtractiveCompressor, CompressionConfig
 
 from safe_r2r.controller.qa_verifier import QAVerifier
+from safe_r2r.controller.checkpointing import load_done_qids, flush_many, save_progress_json
 
 
 def read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
@@ -159,6 +160,8 @@ def main():
     ap.add_argument("--device", type=int, default=0, help="GPU id for verifier models; use -1 for CPU")
     ap.add_argument("--nli_model", type=str, default="roberta-large-mnli")
     ap.add_argument("--qa_model", type=str, default="distilbert-base-cased-distilled-squad")
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--checkpoint_every", type=int, default=500)
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -225,22 +228,41 @@ def main():
     )
     qa_verifier = QAVerifier(model_name=args.qa_model, device=args.device)
 
+    rung_paths = {r: f"{args.out_prefix}_rung{r}.jsonl" for r in [0, 1, 2, 3, 4]}
+    progress_path = f"{args.out_prefix}_progress.json"
+
+    done_by_rung = {}
+    for r, p in rung_paths.items():
+        done_by_rung[r] = load_done_qids(p) if args.resume else set()
+
     out_files = {}
     try:
         for rung in [0, 1, 2, 3, 4]:
-            path = f"{args.out_prefix}_rung{rung}.jsonl"
+            path = rung_paths[rung]
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-            out_files[rung] = open(path, "w", encoding="utf-8")
+            mode = "a" if args.resume and Path(path).exists() else "w"
+            out_files[rung] = open(path, mode, encoding="utf-8")
+
+        processed = 0
+        last_qid = None
 
         for idx, ex in enumerate(tqdm(read_jsonl(args.queries_path), desc="Online controller calibration logs")):
-            if args.max_examples is not None and idx >= int(args.max_examples):
+            if args.max_examples is not None and processed >= int(args.max_examples):
                 break
 
-            qid = ex["qid"]
+            qid = str(ex["qid"])
             q = ex["question"]
             gold = ex["answer"]
+            last_qid = qid
+
+            # skip only if all rung outputs already exist for this qid
+            if all(qid in done_by_rung[r] for r in [0, 1, 2, 3, 4]):
+                continue
 
             for rung in [0, 1, 2, 3, 4]:
+                if qid in done_by_rung[rung]:
+                    continue
+
                 t0 = time.perf_counter()
                 docs = ladder.retrieve(q, rung=rung)
                 t1 = time.perf_counter()
@@ -342,12 +364,40 @@ def main():
                 }
 
                 write_row(out_files[rung], row)
+                done_by_rung[rung].add(qid)
+
+            processed += 1
+
+            if processed % args.checkpoint_every == 0:
+                flush_many(out_files.values())
+                completed_all = len(set.intersection(*(done_by_rung[r] for r in [0, 1, 2, 3, 4])))
+                save_progress_json(progress_path, {
+                    "processed_examples_this_run": processed,
+                    "last_qid": last_qid,
+                    "completed_all_rungs": completed_all,
+                    "resume": bool(args.resume),
+                    "queries_path": args.queries_path,
+                    "out_prefix": args.out_prefix,
+                })
+
+        flush_many(out_files.values())
+        completed_all = len(set.intersection(*(done_by_rung[r] for r in [0, 1, 2, 3, 4])))
+        save_progress_json(progress_path, {
+            "processed_examples_this_run": processed,
+            "last_qid": last_qid,
+            "completed_all_rungs": completed_all,
+            "resume": bool(args.resume),
+            "queries_path": args.queries_path,
+            "out_prefix": args.out_prefix,
+            "done": True,
+        })
 
     finally:
         for fh in out_files.values():
             fh.close()
 
     print("Wrote online calibration logs with prefix:", args.out_prefix)
+    print("Progress file:", progress_path)
 
 
 if __name__ == "__main__":

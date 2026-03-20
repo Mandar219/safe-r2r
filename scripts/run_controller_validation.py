@@ -25,6 +25,7 @@ from safe_r2r.retrieval.compress import ExtractiveCompressor, CompressionConfig
 
 from safe_r2r.controller.scoring import compute_score
 from safe_r2r.controller.qa_verifier import QAVerifier
+from safe_r2r.controller.checkpointing import load_done_qids, flush_fh, save_progress_json
 
 
 def read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
@@ -35,17 +36,6 @@ def read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
                 yield json.loads(line)
 
 
-def write_jsonl(path: str, rows: List[Dict[str, Any]]):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-
-def _safe_mean(xs: List[float]) -> float:
-    return float(sum(xs) / len(xs)) if xs else 0.0
-
-
 def normalize_answer(s: str) -> str:
     if not isinstance(s, str):
         return ""
@@ -54,6 +44,10 @@ def normalize_answer(s: str) -> str:
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def _safe_mean(xs: List[float]) -> float:
+    return float(sum(xs) / len(xs)) if xs else 0.0
 
 
 def split_sentences(text: str) -> List[str]:
@@ -159,6 +153,40 @@ def compute_span_hits(pred_answer: str, retrieved: List[Dict[str, Any]], topk: i
     return span_hit, hits
 
 
+def summarize(rows: List[Dict[str, Any]], rung_order: List[int]) -> Dict[str, Any]:
+    certified_rows = [r for r in rows if int(r.get("accepted_certified", 0)) == 1]
+    answered_rows = [r for r in rows if int(r.get("answered", 0)) == 1]
+    fallback_rows = [r for r in rows if int(r.get("fallback_used", 0)) == 1]
+    unanswered_rows = [r for r in rows if int(r.get("answered", 0)) == 0]
+
+    summary = {
+        "num_queries": len(rows),
+        "num_answered_total": len(answered_rows),
+        "answer_coverage": len(answered_rows) / len(rows) if rows else 0.0,
+        "num_certified_accepted": len(certified_rows),
+        "certified_coverage": len(certified_rows) / len(rows) if rows else 0.0,
+        "num_fallback_answered": len(fallback_rows),
+        "num_unanswered": len(unanswered_rows),
+        "accept_by_rung": {str(r): sum(1 for x in certified_rows if x.get("selected_rung") == r) for r in rung_order},
+        "fallback_by_rung": {str(r): sum(1 for x in fallback_rows if x.get("selected_rung") == r) for r in rung_order},
+    }
+
+    if answered_rows:
+        ems = np.array([int(r["em"]) for r in answered_rows], dtype=int)
+        summary["empirical_accuracy_answered"] = float(np.mean(ems))
+        summary["empirical_risk_answered"] = float(np.mean(1 - ems))
+        for key in ["prompt_tokens", "completion_tokens", "total_tokens", "retrieval_latency_ms", "generation_latency_ms"]:
+            vals = [float(r[key]) for r in answered_rows if r.get(key) is not None]
+            summary[f"avg_{key}_answered"] = _safe_mean(vals)
+
+    if certified_rows:
+        ems = np.array([int(r["em"]) for r in certified_rows], dtype=int)
+        summary["empirical_accuracy_certified"] = float(np.mean(ems))
+        summary["empirical_risk_certified"] = float(np.mean(1 - ems))
+
+    return summary
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="main pipeline config")
@@ -169,6 +197,8 @@ def main():
     ap.add_argument("--force_rung4_fallback", action="store_true")
     ap.add_argument("--split", type=str, default=None, help="override dataset split")
     ap.add_argument("--device", type=int, default=0, help="GPU id for verifier models; use -1 for CPU")
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--checkpoint_every", type=int, default=500)
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -251,250 +281,281 @@ def main():
     )
     qa_verifier = QAVerifier(model_name=qa_model, device=args.device)
 
-    out_rows = []
-    certified_rows = []
-    answered_rows = []
+    done_qids = load_done_qids(args.out) if args.resume else set()
+    progress_path = str(Path(args.summary_out).with_suffix(".progress.json"))
 
-    for idx, ex in enumerate(tqdm(read_jsonl(queries_path), desc="Controller validation")):
-        if args.max_examples is not None and idx >= int(args.max_examples):
-            break
+    mode = "a" if args.resume and Path(args.out).exists() else "w"
+    out_f = open(args.out, mode, encoding="utf-8")
 
-        qid = ex["qid"]
-        q = ex["question"]
-        gold = ex["answer"]
+    processed = 0
+    last_qid = None
 
-        rows_by_rung = {}
-        selected = None
+    try:
+        for idx, ex in enumerate(tqdm(read_jsonl(queries_path), desc="Controller validation")):
+            qid = str(ex["qid"])
+            if qid in done_qids:
+                continue
 
-        for rung in rung_order:
-            t0 = time.perf_counter()
-            docs = ladder.retrieve(q, rung=rung)
-            t1 = time.perf_counter()
+            if args.max_examples is not None and processed >= int(args.max_examples):
+                break
 
-            retrieved_logged = []
-            for d in docs:
-                txt = getattr(d, "text", "") or ""
-                retrieved_logged.append({
-                    "doc_id": d.doc_id,
-                    "score": float(d.score),
-                    "title": d.title,
-                    "text": txt,
-                    "text_chars": len(txt) if isinstance(txt, str) else 0,
-                })
+            q = ex["question"]
+            gold = ex["answer"]
+            last_qid = qid
 
-            if rung == 0:
-                prompt = (
-                    "Answer the question concisely. Use only your internal knowledge.\n\n"
-                    "Output Rules (MUST FOLLOW):\n"
-                    "1) Output ONLY the final answer as a short span (one line).\n"
-                    "2) Do NOT explain.\n"
-                    "3) Do NOT add extra words.\n"
-                    "4) Do NOT include quotes.\n"
-                    "5) Do NOT repeat the question.\n"
-                    "6) If yes/no, output exactly: yes OR no\n"
-                    "7) If the documents do not contain enough information, output exactly: Insufficient evidence\n\n"
-                    f"Question: {q}\n"
-                    "Final answer:"
+            rows_by_rung = {}
+            selected = None
+
+            for rung in rung_order:
+                t0 = time.perf_counter()
+                docs = ladder.retrieve(q, rung=rung)
+                t1 = time.perf_counter()
+
+                retrieved_logged = []
+                for d in docs:
+                    txt = getattr(d, "text", "") or ""
+                    retrieved_logged.append({
+                        "doc_id": d.doc_id,
+                        "score": float(d.score),
+                        "title": d.title,
+                        "text": txt,
+                        "text_chars": len(txt) if isinstance(txt, str) else 0,
+                    })
+
+                if rung == 0:
+                    prompt = (
+                        "Answer the question concisely. Use only your internal knowledge.\n\n"
+                        "Output Rules (MUST FOLLOW):\n"
+                        "1) Output ONLY the final answer as a short span (one line).\n"
+                        "2) Do NOT explain.\n"
+                        "3) Do NOT add extra words.\n"
+                        "4) Do NOT include quotes.\n"
+                        "5) Do NOT repeat the question.\n"
+                        "6) If yes/no, output exactly: yes OR no\n"
+                        "7) If the documents do not contain enough information, output exactly: Insufficient evidence\n\n"
+                        f"Question: {q}\n"
+                        "Final answer:"
+                    )
+                else:
+                    prompt = build_rag_prompt(q, docs)
+
+                t2 = time.perf_counter()
+                resp = llm.generate(prompt)
+                t3 = time.perf_counter()
+
+                raw_pred = (resp.get("text") or "").strip()
+                pred = postprocess_answer(raw_pred)
+
+                prf = precision_recall_f1(pred, gold)
+                em = exact_match(pred, gold)
+
+                retrieval_latency = (t1 - t0) * 1000.0
+                meta = resp.get("meta", {}) or {}
+                gen_latency = float(meta.get("latency_ms", (t3 - t2) * 1000.0))
+
+                pt = int(meta.get("prompt_tokens", -1))
+                ct = int(meta.get("completion_tokens", -1))
+                tt = int(meta.get("total_tokens", (pt + ct) if pt >= 0 and ct >= 0 else -1))
+
+                verifier_sent_max_margin = compute_sentence_max_verifier(
+                    nli=nli,
+                    question=q,
+                    pred_answer=pred,
+                    retrieved=retrieved_logged,
+                    topk_docs=5,
                 )
+
+                span_hit, span_doc_hits = compute_span_hits(pred, retrieved_logged, topk=15)
+
+                qa_answer, qa_score, qa_match_em, qa_match_f1 = qa_verifier.verify(
+                    question=q,
+                    pred_answer=pred,
+                    retrieved=retrieved_logged,
+                    topk_docs=5,
+                    max_context_chars=6000,
+                )
+
+                row = {
+                    "qid": qid,
+                    "question": q,
+                    "gold_answer": gold,
+                    "raw_pred_answer": raw_pred,
+                    "pred_answer": pred,
+                    "rung": int(rung),
+                    "num_docs": len(retrieved_logged),
+                    "retrieved": retrieved_logged,
+                    "retrieval_latency_ms": retrieval_latency,
+                    "generation_latency_ms": gen_latency,
+                    "prompt_tokens": pt,
+                    "completion_tokens": ct,
+                    "total_tokens": tt,
+                    "em": int(em),
+                    "precision": prf.precision,
+                    "recall": prf.recall,
+                    "f1": prf.f1,
+                    "is_insufficient": int(normalize_answer(pred) == "insufficient evidence"),
+                    "verifier_sent_max_margin": verifier_sent_max_margin,
+                    "span_hit": span_hit,
+                    "span_doc_hits": span_doc_hits,
+                    "qa_verifier_answer": qa_answer,
+                    "qa_verifier_score": qa_score,
+                    "qa_match_em": qa_match_em,
+                    "qa_match_f1": qa_match_f1,
+                    "llm_backend": llm_cfg.backend,
+                    "llm_model": llm_cfg.model_name,
+                    "nli_model": nli_model,
+                    "qa_model": qa_verifier.model_name,
+                }
+
+                score = compute_score(
+                    row,
+                    wq=float(weights["wq"]),
+                    wv=float(weights["wv"]),
+                    ws=float(weights["ws"]),
+                    wi=float(weights["wi"]),
+                    wl=float(weights["wl"]),
+                    wt=float(weights["wt"]),
+                    topk_hit_k=int(knobs.get("top2_hit_k", 2)),
+                    length_limit=int(knobs.get("length_limit", 5)),
+                )
+                row["controller_score"] = score
+                rows_by_rung[rung] = row
+
+                tau = taus.get(rung, None)
+                if tau is not None and score <= tau:
+                    selected = (rung, tau, row)
+                    break
+
+            fallback_used = 0
+            answered = 1
+            accepted_certified = 1
+
+            if selected is None:
+                if args.force_rung4_fallback:
+                    fallback_used = 1
+                    accepted_certified = 0
+                    final_rung = max(rung_order)
+                    final_tau = taus.get(final_rung, None)
+                    final_row = rows_by_rung[final_rung]
+                else:
+                    answered = 0
+                    accepted_certified = 0
+                    out = {
+                        "qid": qid,
+                        "question": q,
+                        "gold_answer": gold,
+                        "answered": 0,
+                        "accepted_certified": 0,
+                        "selected_rung": None,
+                        "fallback_used": 0,
+                        "reason": "no_rung_passed",
+                    }
+                    out_f.write(json.dumps(out, ensure_ascii=False) + "\n")
+                    done_qids.add(qid)
+                    processed += 1
+                    if processed % args.checkpoint_every == 0:
+                        flush_fh(out_f)
+                        save_progress_json(progress_path, {
+                            "processed_examples_this_run": processed,
+                            "done_qids": len(done_qids),
+                            "last_qid": last_qid,
+                            "out": args.out,
+                            "split": split,
+                        })
+                    continue
             else:
-                prompt = build_rag_prompt(q, docs)
+                final_rung, final_tau, final_row = selected
 
-            t2 = time.perf_counter()
-            resp = llm.generate(prompt)
-            t3 = time.perf_counter()
+            if answered == 1 and global_tau is not None and final_row["controller_score"] > global_tau:
+                if args.force_rung4_fallback:
+                    fallback_used = 1
+                    accepted_certified = 0
+                    final_rung = max(rung_order)
+                    final_tau = taus.get(final_rung, None)
+                    final_row = rows_by_rung[final_rung]
+                else:
+                    answered = 0
+                    accepted_certified = 0
+                    out = {
+                        "qid": qid,
+                        "question": q,
+                        "gold_answer": gold,
+                        "answered": 0,
+                        "accepted_certified": 0,
+                        "selected_rung": None,
+                        "fallback_used": 0,
+                        "reason": "failed_global_controller_gate",
+                    }
+                    out_f.write(json.dumps(out, ensure_ascii=False) + "\n")
+                    done_qids.add(qid)
+                    processed += 1
+                    if processed % args.checkpoint_every == 0:
+                        flush_fh(out_f)
+                        save_progress_json(progress_path, {
+                            "processed_examples_this_run": processed,
+                            "done_qids": len(done_qids),
+                            "last_qid": last_qid,
+                            "out": args.out,
+                            "split": split,
+                        })
+                    continue
 
-            raw_pred = (resp.get("text") or "").strip()
-            pred = postprocess_answer(raw_pred)
-
-            prf = precision_recall_f1(pred, gold)
-            em = exact_match(pred, gold)
-
-            retrieval_latency = (t1 - t0) * 1000.0
-            meta = resp.get("meta", {}) or {}
-            gen_latency = float(meta.get("latency_ms", (t3 - t2) * 1000.0))
-
-            pt = int(meta.get("prompt_tokens", -1))
-            ct = int(meta.get("completion_tokens", -1))
-            tt = int(meta.get("total_tokens", (pt + ct) if pt >= 0 and ct >= 0 else -1))
-
-            verifier_sent_max_margin = compute_sentence_max_verifier(
-                nli=nli,
-                question=q,
-                pred_answer=pred,
-                retrieved=retrieved_logged,
-                topk_docs=5,
-            )
-
-            span_hit, span_doc_hits = compute_span_hits(pred, retrieved_logged, topk=15)
-
-            qa_answer, qa_score, qa_match_em, qa_match_f1 = qa_verifier.verify(
-                question=q,
-                pred_answer=pred,
-                retrieved=retrieved_logged,
-                topk_docs=5,
-                max_context_chars=6000,
-            )
-
-            row = {
+            out = {
                 "qid": qid,
                 "question": q,
                 "gold_answer": gold,
-                "raw_pred_answer": raw_pred,
-                "pred_answer": pred,
-                "rung": int(rung),
-                "num_docs": len(retrieved_logged),
-                "retrieved": retrieved_logged,
-                "retrieval_latency_ms": retrieval_latency,
-                "generation_latency_ms": gen_latency,
-                "prompt_tokens": pt,
-                "completion_tokens": ct,
-                "total_tokens": tt,
-                "em": int(em),
-                "precision": prf.precision,
-                "recall": prf.recall,
-                "f1": prf.f1,
-                "is_insufficient": int(normalize_answer(pred) == "insufficient evidence"),
-                "verifier_sent_max_margin": verifier_sent_max_margin,
-                "span_hit": span_hit,
-                "span_doc_hits": span_doc_hits,
-                "qa_verifier_answer": qa_answer,
-                "qa_verifier_score": qa_score,
-                "qa_match_em": qa_match_em,
-                "qa_match_f1": qa_match_f1,
-                "llm_backend": llm_cfg.backend,
-                "llm_model": llm_cfg.model_name,
-                "nli_model": nli_model,
-                "qa_model": qa_verifier.model_name,
+                "pred_answer": final_row["pred_answer"],
+                "answered": answered,
+                "accepted_certified": accepted_certified,
+                "selected_rung": final_rung,
+                "fallback_used": fallback_used,
+                "controller_score": final_row["controller_score"],
+                "tau": final_tau,
+                "em": final_row["em"],
+                "f1": final_row["f1"],
+                "qa_match_f1": final_row["qa_match_f1"],
+                "qa_match_em": final_row["qa_match_em"],
+                "verifier_sent_max_margin": final_row["verifier_sent_max_margin"],
+                "span_doc_hits": final_row["span_doc_hits"],
+                "prompt_tokens": final_row["prompt_tokens"],
+                "completion_tokens": final_row["completion_tokens"],
+                "total_tokens": final_row["total_tokens"],
+                "retrieval_latency_ms": final_row["retrieval_latency_ms"],
+                "generation_latency_ms": final_row["generation_latency_ms"],
             }
+            out_f.write(json.dumps(out, ensure_ascii=False) + "\n")
 
-            score = compute_score(
-                row,
-                wq=float(weights["wq"]),
-                wv=float(weights["wv"]),
-                ws=float(weights["ws"]),
-                wi=float(weights["wi"]),
-                wl=float(weights["wl"]),
-                wt=float(weights["wt"]),
-                topk_hit_k=int(knobs.get("top2_hit_k", 2)),
-                length_limit=int(knobs.get("length_limit", 5)),
-            )
-            row["controller_score"] = score
-            rows_by_rung[rung] = row
+            done_qids.add(qid)
+            processed += 1
 
-            tau = taus.get(rung, None)
-            if tau is not None and score <= tau:
-                selected = (rung, tau, row)
-                break
-
-        fallback_used = 0
-        answered = 1
-        accepted_certified = 1
-
-        if selected is None:
-            if args.force_rung4_fallback:
-                fallback_used = 1
-                accepted_certified = 0
-                final_rung = max(rung_order)
-                final_tau = taus.get(final_rung, None)
-                final_row = rows_by_rung[final_rung]
-            else:
-                answered = 0
-                accepted_certified = 0
-                out_rows.append({
-                    "qid": qid,
-                    "question": q,
-                    "gold_answer": gold,
-                    "answered": 0,
-                    "accepted_certified": 0,
-                    "selected_rung": None,
-                    "fallback_used": 0,
-                    "reason": "no_rung_passed",
+            if processed % args.checkpoint_every == 0:
+                flush_fh(out_f)
+                save_progress_json(progress_path, {
+                    "processed_examples_this_run": processed,
+                    "done_qids": len(done_qids),
+                    "last_qid": last_qid,
+                    "out": args.out,
+                    "split": split,
                 })
-                continue
-        else:
-            final_rung, final_tau, final_row = selected
 
-        if answered == 1 and global_tau is not None and final_row["controller_score"] > global_tau:
-            if args.force_rung4_fallback:
-                fallback_used = 1
-                accepted_certified = 0
-                final_rung = max(rung_order)
-                final_tau = taus.get(final_rung, None)
-                final_row = rows_by_rung[final_rung]
-            else:
-                answered = 0
-                accepted_certified = 0
-                out_rows.append({
-                    "qid": qid,
-                    "question": q,
-                    "gold_answer": gold,
-                    "answered": 0,
-                    "accepted_certified": 0,
-                    "selected_rung": None,
-                    "fallback_used": 0,
-                    "reason": "failed_global_controller_gate",
-                })
-                continue
+        flush_fh(out_f)
+        save_progress_json(progress_path, {
+            "processed_examples_this_run": processed,
+            "done_qids": len(done_qids),
+            "last_qid": last_qid,
+            "out": args.out,
+            "split": split,
+            "done": True,
+        })
 
-        out = {
-            "qid": qid,
-            "question": q,
-            "gold_answer": gold,
-            "pred_answer": final_row["pred_answer"],
-            "answered": answered,
-            "accepted_certified": accepted_certified,
-            "selected_rung": final_rung,
-            "fallback_used": fallback_used,
-            "controller_score": final_row["controller_score"],
-            "tau": final_tau,
-            "em": final_row["em"],
-            "f1": final_row["f1"],
-            "qa_match_f1": final_row["qa_match_f1"],
-            "qa_match_em": final_row["qa_match_em"],
-            "verifier_sent_max_margin": final_row["verifier_sent_max_margin"],
-            "span_doc_hits": final_row["span_doc_hits"],
-            "prompt_tokens": final_row["prompt_tokens"],
-            "completion_tokens": final_row["completion_tokens"],
-            "total_tokens": final_row["total_tokens"],
-            "retrieval_latency_ms": final_row["retrieval_latency_ms"],
-            "generation_latency_ms": final_row["generation_latency_ms"],
-        }
-        out_rows.append(out)
+    finally:
+        out_f.close()
 
-        if answered == 1:
-            answered_rows.append(out)
-        if accepted_certified == 1:
-            certified_rows.append(out)
-
-    write_jsonl(args.out, out_rows)
-
-    summary = {
-        "num_queries": len(out_rows),
-        "num_answered_total": len(answered_rows),
-        "answer_coverage": len(answered_rows) / len(out_rows) if out_rows else 0.0,
-        "num_certified_accepted": len(certified_rows),
-        "certified_coverage": len(certified_rows) / len(out_rows) if out_rows else 0.0,
-        "num_fallback_answered": sum(int(r.get("fallback_used", 0)) for r in out_rows),
-        "num_unanswered": sum(1 for r in out_rows if int(r.get("answered", 0)) == 0),
-        "accept_by_rung": {str(r): sum(1 for x in certified_rows if x.get("selected_rung") == r) for r in rung_order},
-        "fallback_by_rung": {str(r): sum(1 for x in out_rows if int(x.get("fallback_used", 0)) == 1 and x.get("selected_rung") == r) for r in rung_order},
-        "controller_config": controller_cfg,
-        "force_rung4_fallback": bool(args.force_rung4_fallback),
-        "split": split,
-    }
-
-    if answered_rows:
-        ems = np.array([int(r["em"]) for r in answered_rows], dtype=int)
-        summary["empirical_accuracy_answered"] = float(np.mean(ems))
-        summary["empirical_risk_answered"] = float(np.mean(1 - ems))
-        for key in ["prompt_tokens", "completion_tokens", "total_tokens", "retrieval_latency_ms", "generation_latency_ms"]:
-            vals = [float(r[key]) for r in answered_rows if r.get(key) is not None]
-            summary[f"avg_{key}_answered"] = _safe_mean(vals)
-
-    if certified_rows:
-        ems = np.array([int(r["em"]) for r in certified_rows], dtype=int)
-        summary["empirical_accuracy_certified"] = float(np.mean(ems))
-        summary["empirical_risk_certified"] = float(np.mean(1 - ems))
+    rows = list(read_jsonl(args.out))
+    summary = summarize(rows, rung_order=rung_order)
+    summary["controller_config"] = controller_cfg
+    summary["force_rung4_fallback"] = bool(args.force_rung4_fallback)
+    summary["split"] = split
 
     with open(args.summary_out, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
